@@ -1,23 +1,204 @@
 # user-center（用户中心）
 
-一个“前后端分离”的用户中心小项目：后端提供注册 / 登录 / Session 登录态 / 管理员接口；前端提供登录、个人资料、后台用户管理等页面。
+一个“前后端分离”的用户中心小项目：后端提供注册 / 登录 / JWT 登录态（HttpOnly Cookie + 双 token）/ 管理员接口；前端提供登录、个人资料、后台用户管理等页面。
 
-## 明确说明【这是学习/练手项目】
+## 明确说明（项目演进：Session → JWT）
 
-> 本项目为个人学习 / 练手项目。  
-> 用于熟悉 Spring Boot + Vue 的完整开发流程。  
-> 并非生产级用户系统。
+本项目是在原有 **Session（JSESSIONID）登录态方案**基础上改造而来，核心目标是：
+
+- ✅ 将传统“有状态认证”升级为“无状态 JWT 认证”，并补齐安全机制
+
+
+---
+
+### 🧱 改造前（Session 模式）
+
+原项目使用典型的：
+
+- `HttpSession + JSESSIONID Cookie`
+
+工作方式：
+
+1. 登录成功 → 服务端保存用户到 Session
+2. 浏览器保存 `JSESSIONID`
+3. 每次请求通过 Session 获取用户
+
+```
+前端 → Cookie(JSESSIONID) → 后端 → Session → 用户信息
+```
+
+---
+
+### ⚙️ 改造后（JWT + HttpOnly Cookie）
+
+本项目完成了完整的 JWT 化改造：
+
+```
+前端 → Cookie(JWT) → 后端 → 解析 Token → 用户信息
+```
+
+核心变化：
+
+- ❌ 移除 Session
+- ✅ 引入 JWT（Json Web Token）
+- ✅ 登录态改为 HttpOnly Cookie
+- ✅ 通过拦截器统一鉴权
+
+---
+
+## 🔑 关键改造点（核心价值）
+
+### 1）JWT 替代 Session
+
+- 登录成功后：
+    - 不再写入 Session
+    - 改为签发 JWT
+- JWT 存储：
+    - 使用 **HttpOnly Cookie**
+    - 前端无法读取，浏览器自动携带
+
+👉 实现“无状态认证”
+
+---
+
+### 2）token_version（解决 JWT 无法失效的问题）
+
+JWT 最大问题：**一旦签发，默认无法主动失效**
+
+本项目通过数据库字段解决：
+
+```sql
+token_version INT NOT NULL DEFAULT 0
+```
+
+机制：
+
+- JWT 中写入：`ver`
+- 每次请求校验：
+    
+    ```
+    token.ver == user.token_version
+    ```
+    
+- 以下操作会使 token 立即失效：
+    - 登出
+    - 修改密码
+    - 封禁用户
+
+👉 实现：**“伪无状态 + 可控失效”**
+
+---
+
+### 3）JwtAuthInterceptor（统一认证入口）
+
+新增拦截器：
+
+- 拦截所有请求 `/**`
+- 白名单放行：
+    - `/user/login`
+    - `/user/register`
+    - `/user/logout`
+    - `/user/refresh`
+    - `/user/session/ttl`
+    - `/public/**`
+    - `/swagger-ui/**`
+    - `/swagger-ui.html`
+    - `/v3/api-docs/**`
+    - `/error`
+- 核心逻辑：
+    1. 从 Cookie 读取 JWT
+    2. 验签 + 校验过期
+    3. 校验 token_version
+    4. 注入当前用户到 request
+
+👉 替代 Session 获取用户
+
+---
+
+### 4）CSRF 防护（关键安全点）
+
+由于 JWT 放在 Cookie 中，引入 CSRF 风险。
+
+本项目实现：
+
+### ✅ Double Submit Cookie
+
+- Cookie：`csrf_token`
+- Header：`X-CSRF-Token`
+
+校验规则：
+
+```
+Cookie.csrf_token == Header.X-CSRF-Token
+```
+
+👉 防止跨站请求伪造（很多 JWT 教程会忽略）
+
+---
+
+### 5）登录 / 登出行为变化
+
+### 登录
+
+- 返回：用户信息
+- 设置：
+    - `token`（HttpOnly）
+    - `refresh_token`（HttpOnly）
+    - `csrf_token`
+
+### 登出（重点）
+
+- 不只是清 Cookie
+- 还会：
+    
+    ```sql
+    token_version + 1
+    ```
+    
+
+👉 确保旧 token **立即失效**
+
+---
+
+### 6）前端改造点
+
+- 不再存 token（localStorage ❌）
+- 全部依赖 Cookie 自动携带
+- Axios：
+
+```tsx
+withCredentials: true
+```
+
+- 写请求自动加：
+
+```tsx
+X-CSRF-Token
+```
+
+---
+
+## ⚠️ 当前实现的取舍
+
+为了突出学习重点，当前方案有意简化：
+
+- 未引入 Redis 黑名单
+- 未做 Refresh Token Rotation
+- 未使用 Spring Security
+
+👉 但核心认证链路已经完整
 
 
 ## 功能清单 / Feature List
 
 ### 用户侧
 
-- 用户注册 / 登录（Session 登录态）
+- 用户注册 / 登录（JWT 登录态：Access Token + Refresh Token 存 HttpOnly Cookie）
 - 获取当前登录用户信息
 - 修改个人资料
-- 退出登录
-- 查看 Session 剩余有效时间
+- 退出登录（服务端 token_version 自增，旧 token 立即失效）
+- 查看 JWT 有效期（秒）
+- Access 过期时前端自动用 Refresh Token 换发（双 token 续期，前端内置 401 自动刷新）
 
 ### 管理员侧
 
@@ -31,6 +212,9 @@
 - 参数校验（`@Valid`）
 - 统一返回体（`ApiResponse` + `GlobalResponseAdvice`）
 - 统一异常处理（`GlobalExceptionHandler`）
+- JWT 鉴权拦截（黑名单排除：`/**` 排除登录/注册/登出/refresh/TTL/文档等）
+- CSRF 防护（Double Submit Cookie，写操作校验 `X-CSRF-Token`）
+- CORS 配置（可选，前后端分离部署时配置 `cors.allowed-origins`）
 - 管理员鉴权拦截（拦截 `/admin/**`）
 - Swagger / OpenAPI 接口文档
 
@@ -39,24 +223,33 @@
 本项目采用典型的前后端分离架构：前端负责页面展示与交互，后端负责业务与数据，二者通过 HTTP 接口通信。
 
 - 前端（`user-center-web`）
-- 负责页面展示与用户交互（登录、个人资料、后台管理页面等）
-- 通过 Axios 调用后端接口（比如 `/user/login`、`/admin/user/search`）
-- 开发环境通过 Vite 代理把 `/user`、`/admin` 转发到后端，避免跨域
+  - 负责页面展示与用户交互（登录、个人资料、后台管理页面等）
+  - 通过 Axios 调用后端接口（比如 `/user/login`、`/admin/user/search`）
+  - 开发环境通过 Vite 代理把 `/user`、`/admin` 转发到后端，避免跨域
 
 - 后端（`user-center`）
-- 提供 RESTful API（`/user/**`、`/admin/**`）
-- 使用 Session 维护登录态（登录成功后写入 `USER_LOGIN_STATE`，浏览器用 `JSESSIONID` 识别会话）
-- 通过拦截器统一做管理员鉴权（拦截 `/admin/**`，未登录 401、无权限 403）
-- 使用 MyBatis-Plus 操作数据库，`isDelete` 字段实现逻辑删除
-- 统一响应与异常：正常返回用 `ApiResponse` 包装，异常由全局异常处理器统一输出
+  - 提供 RESTful API（`/user/**`、`/admin/**`）
+  - 使用 JWT（HttpOnly Cookie）维护登录态，双 token：Access Token（鉴权）+ Refresh Token（仅换发）
+  - 通过拦截器统一做管理员鉴权（拦截 `/admin/**`，未登录 401、无权限 403）
+  - 使用 MyBatis-Plus 操作数据库，`isDelete` 字段实现逻辑删除
+  - 统一响应与异常：正常返回用 `ApiResponse` 包装，异常由全局异常处理器统一输出
 
 - 数据库（MySQL）
-- 三张核心表：`user`（用户）、`role`（角色字典）、`user_role`（用户-角色关系）
-- 当前设计：`user_role.user_id` 唯一，因此一个用户最多绑定一个角色
+  - 三张核心表：`user`（用户）、`role`（角色字典）、`user_role`（用户-角色关系）
+  - 当前设计：`user_role.user_id` 唯一，因此一个用户最多绑定一个角色
 
 - 通信方式
-- 前端 <-> 后端：HTTP（JSON）
-- 后端 <-> 数据库：MyBatis-Plus（CRUD）
+  - 前端 <-> 后端：HTTP（JSON）
+  - 后端 <-> 数据库：MyBatis-Plus（CRUD）
+
+### 认证与安全说明（JWT + Cookie）
+
+- **Token 类型（type claim）**：claim 名为 `type`（也可用标准 `typ`）。取值**固定枚举**：`access` / `refresh`（全小写）。校验时**不区分大小写、trim 首尾空格**，仅接受上述两值，避免大小写/空格绕过。
+- **校验顺序**：**先验签、验 exp，再根据 claims 判定 type**。type 判定一律基于验签后的 payload，伪造的 type 无法影响逻辑分支。
+- **CSRF**：写操作（含 POST `/user/refresh`）均走 Double Submit Cookie：Cookie `csrf_token` 与 header `X-CSRF-Token` 一致才放行。**/user/refresh 不在 CSRF 排除列表**，与登录一致受保护。
+- **Refresh Token 风险与可选增强**：当前 Refresh Token 为**纯 JWT、自校验、不落库、不 rotation**。
+  - **风险**：若 Refresh 泄露，在有效期内可被持续用于换发新 Access，从而间接调用业务接口；“影响更小”的前提是 Refresh 更难被获取（HttpOnly + 同源/可信域）且建议配合 rotation。
+  - **可选增强（下一期）**：**Refresh Rotation** — Refresh 单次使用、换发后旧 Refresh 失效；DB 存 Refresh 哈希或版本，复用检测；可与 `token_version` 联动实现全端失效。文档中将其列为可选增强，并明确不 rotation 时的上述风险。
 
 ## 技术栈
 
@@ -75,6 +268,7 @@
 - `mysql-connector-j`：连接 MySQL 的驱动
 - `lombok`：自动生成 getter/setter（少写样板代码）
 - `springdoc-openapi-starter-webmvc-ui`：Swagger UI + OpenAPI 文档
+- `jjwt-api` / `jjwt-impl` / `jjwt-jackson`（0.12.x）：JWT 签发与解析
 - `spring-boot-devtools`（可选）：开发热重载
 
 Lombok 注意点：
@@ -108,7 +302,7 @@ Lombok 注意点：
    CREATE DATABASE IF NOT EXISTS yupi DEFAULT CHARACTER SET utf8mb4;
    ```
 
-2. 创建 `user` 表（下面这份结构对齐你现在库里的 `user` 表字段）：
+2. 创建 `user` 表（下面这份结构对齐你现在库里的 `user` 表字段；若已有表，需执行 `user-center/src/main/resources/migration_token_version.sql` 增加 `token_version`）：
 
    ```sql
    USE yupi;
@@ -124,6 +318,7 @@ Lombok 注意点：
      `email` VARCHAR(512) DEFAULT NULL,
      `userStatus` INT NOT NULL DEFAULT 0,
      `createTime` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+     `token_version` INT NOT NULL DEFAULT 0,
      `updateTime` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
      `isDelete` TINYINT(1) NOT NULL DEFAULT 0,
      `userRole` TINYINT(1) NOT NULL DEFAULT 0,
@@ -152,6 +347,8 @@ Lombok 注意点：
    - 必填：`DB_PASSWORD`（数据库密码）
    - 可选：`DB_URL`（数据库连接串，不配则使用本地默认值）
    - 可选：`DB_USERNAME`（数据库账号，不配则默认 `root`）
+   - 可选：`JWT_SECRET`（JWT 签名密钥，生产环境务必配置）
+   - 可选：`CORS_ALLOWED_ORIGINS`（前后端分离部署时，逗号分隔的允许源，如 `http://localhost:3000`）
 
    临时生效（只对当前 PowerShell 窗口有效，关闭窗口就没了）：
 
@@ -202,7 +399,7 @@ Lombok 注意点：
 
 ## 数据库表设计（三张表）
 
-数据库里这三张表”：`user`、`role`、`user_role`。
+数据库里这三张表：`user`、`role`、`user_role`。
 
 ### 1）user（用户表）
 
@@ -219,6 +416,7 @@ Lombok 注意点：
 - `userRole`：老的“单字段角色”（0 普通用户、1 管理员）
 - `createTime` / `updateTime`：创建时间 / 更新时间
 - `isDelete`：逻辑删除标记（0 未删、1 已删）
+- `token_version`：JWT 版本号（INT NOT NULL DEFAULT 0），登出/改密/封禁时自增，使旧 token 立即失效
 
 ### 2）role（角色表）
 
@@ -248,11 +446,12 @@ Lombok 注意点：
 ### 普通用户接口
 
 - `POST /user/register`：注册
-- `POST /user/login`：登录（成功后用 Session 记录登录态）
-- `GET /user/current`：获取当前登录用户（未登录会 401）
-- `POST /user/logout`：退出登录
-- `POST /user/update`：更新自己的资料（必须登录）
-- `GET /user/session/ttl`：查看 Session 过期时间（秒）
+- `POST /user/login`：登录（成功后 Set-Cookie：Access Token、Refresh Token、csrf_token；body 返回脱敏用户信息）
+- `POST /user/refresh`：用 Refresh Token 换发新的 Access + Refresh Token（需带 CSRF header；Access 过期时前端可自动调用）
+- `GET /user/current`：获取当前登录用户（依赖 Access Token Cookie，未登录或 token 无效会 401）
+- `POST /user/logout`：退出登录（服务端 token_version 自增并清除 Cookie；幂等）
+- `POST /user/update`：更新自己的资料（必须登录；写操作需带 `X-CSRF-Token`）
+- `GET /user/session/ttl`：返回 JWT 有效期（秒），无需登录
 
 ### 管理员接口（统一走 `/admin/**`）
 
@@ -266,14 +465,15 @@ Lombok 注意点：
 
 你也可以直接用后端自带的请求示例：
 
-- `user-center/src/main/resources/test.http`
+- `user-center/src/main/resources/test.http`（为旧版 Session 示例，当前 JWT 版请以 Cookie `token` / `refresh_token` / `csrf_token` 为准）
 
 ## 权限与登录态
-- 本项目使用 Session 做登录态：你登录成功后，后端会在响应里给浏览器一个 `JSESSIONID`（Cookie）。
-- 之后你访问需要登录的接口，浏览器会自动带上这个 Cookie，后端就知道“你是谁”。
-- 管理员接口统一拦截 `/admin/**`：
-  - 没登录：返回 401（`NOT_LOGIN`）
-  - 不是管理员：返回 403（`NO_AUTH`）
+
+- **登录态**：JWT 存于 HttpOnly Cookie（`token` = Access Token，`refresh_token` = Refresh Token）。登录成功后后端 Set-Cookie，浏览器自动携带，前端无需读写 token。
+- **鉴权**：需登录的接口由 JwtAuthInterceptor 从 Cookie 读取 Access Token，验签、校验 `token_version` 与 DB 一致后注入当前用户。
+- **写操作**：POST/PUT/DELETE/PATCH 需在请求头带 `X-CSRF-Token`（与 Cookie 中 `csrf_token` 一致），否则 403。
+- **续期**：Access Token 过期后，前端收到 401 时可自动调用 `POST /user/refresh`（携带 Refresh Token Cookie + CSRF header）换发新 token 并重试原请求。
+- **管理员接口**（`/admin/**`）：在 JWT 鉴权通过后，再校验是否为管理员；未登录 401，非管理员 403。
 
 管理员判断规则（满足任一即可）：
 
@@ -301,9 +501,9 @@ ON DUPLICATE KEY UPDATE role_id = VALUES(role_id);
 
 ## 常见问题
 
-- 调用管理员接口一直 401：先调用 `/user/login` 登录，并确保请求能带上 Cookie（例如 Postman/浏览器会自动带，手写 curl 需要自己带 Cookie）。
-- 前端请求报跨域：正常情况下不会，因为 `user-center-web/vite.config.ts` 已把 `/user`、`/admin` 代理到后端 `8090`。
-- 导入 `schema_role.sql` 报错：请先创建 `user` 表（因为 `user_role` 有外键引用 `user(id)`）。
+- **调用管理员接口一直 401**：先调用 `POST /user/login` 登录，并确保请求能带上 Cookie（`withCredentials: true`；Postman/浏览器会自动带，手写 curl 需 `-b` 带 Cookie）。写操作还需带 header `X-CSRF-Token`（与 Cookie 中 `csrf_token` 一致）。
+- **前端请求报跨域**：开发环境一般不会，因 Vite 已把 `/user`、`/admin` 代理到后端 8090。前后端分离部署时，需配置后端 `cors.allowed-origins`（或环境变量 `CORS_ALLOWED_ORIGINS`）为前端源，且须 `allowCredentials: true`。
+- **导入 `schema_role.sql` 报错**：请先创建 `user` 表（因 `user_role` 外键引用 `user(id)`）。若已有 `user` 表但无 `token_version` 字段，请执行 `user-center/src/main/resources/migration_token_version.sql`。
 ## 项目演示截图
 <img width="1635" height="734" alt="image" src="https://github.com/user-attachments/assets/6e00cb8d-6519-4385-a6de-73813c1e06ed" />
 <img width="1909" height="761" alt="image" src="https://github.com/user-attachments/assets/81c48dde-90ba-4e9d-bb42-e6cd572860ef" />
@@ -312,131 +512,25 @@ ON DUPLICATE KEY UPDATE role_id = VALUES(role_id);
 <img width="1649" height="788" alt="image" src="https://github.com/user-attachments/assets/d055a92e-4047-4ffb-9442-2d6268047906" />
 <img width="1846" height="746" alt="image" src="https://github.com/user-attachments/assets/eec3e402-31c5-4d1f-981e-5f3c62410a60" />
 
-## 后续可扩展方向（Spring Security + JWT + Redis）
+## 后续可扩展方向
 
-### 1）引入 Spring Security（统一认证与授权）
+当前已实现：JWT（HttpOnly Cookie）、双 token（Access + Refresh）、token_version 登出/改密即时失效、CSRF Double Submit、CORS 可选配置。
 
-当前实现：
-- 使用自定义拦截器判断登录态
-- 管理员权限通过代码手动校验
-- 登录态：Http Session（`USER_LOGIN_STATE` + `JSESSIONID`）
-- 管理员鉴权：自定义拦截器拦截 `/admin/**`，在拦截器里判断是否管理员
-- 授权粒度：偏“路径级别”（只要是 `/admin/**` 就需要管理员）
+### 1）Refresh Rotation（Refresh Token 单次使用）
 
-可扩展为：
-- 使用 Spring Security 统一接管认证与授权流程
-- 自定义 `UserDetailsService`，从数据库加载用户与角色信息
-- 使用 `SecurityContext` 保存当前登录用户
-- 通过注解方式控制权限，例如：
-  - `@PreAuthorize(\"hasRole('ADMIN')\")`
-  - `@PreAuthorize(\"hasAuthority('user:delete')\")`
+当前：Refresh Token 为纯 JWT、不落库、不 rotation，泄露后在有效期内可被持续用于换发。
 
-预期收益：
-- 认证与授权逻辑标准化、可维护性更高
-- 更容易把“路径级权限”升级为“接口级/方法级权限”
-- 统一处理 401/403、权限不足提示更一致
+可扩展为：换发时使旧 Refresh 失效（DB 存 Refresh 哈希或版本，单次使用 + 复用检测），可与 `token_version` 联动实现全端失效。
 
-### 2）引入 Redis（缓存与登录态增强）
+### 2）引入 Spring Security（统一认证与授权）
 
-当前实现：
-- 登录态基于 Http Session（内存 / 容器级别）
-- 服务重启后 Session 会丢失
-- 角色判断需要查数据库（例如 user_role + role）
+当前：自定义 JwtAuthInterceptor + AdminAuthInterceptor，路径级鉴权。
 
-可扩展为：
-- 使用 Redis 做 Session 存储（Spring Session + Redis）
-- 或将用户登录信息缓存到 Redis（例如 `userId -> 用户信息`）
-- 使用 Redis 缓存：
-  - 角色 / 权限列表
-  - 热点用户信息
-  - 管理员鉴权相关的查询结果（减少频繁查库）
+可扩展为：Spring Security 接管认证与授权，`UserDetailsService`、`SecurityContext`，注解式权限（如 `@PreAuthorize("hasRole('ADMIN')")`），接口级/方法级权限。
 
-预期收益：
-- 支持服务重启不丢登录态（取决于你选 Session 还是 Token 方案）
-- 提升性能（减少数据库压力）
-- 为后续多实例/集群部署打基础
+### 3）引入 Redis（缓存与鉴权增强）
 
-### 3）从 Cookie + Session 升级为 Token（JWT）认证
+当前：鉴权每次查库校验 `token_version`，角色判断查 user_role + role。
 
-当前实现：
-- 浏览器通过 Cookie 自动携带 `JSESSIONID`
-- 后端依赖 Session 识别用户身份
-
-可扩展为：
-- 登录成功后返回 JWT（Access Token），前端保存并在请求头携带：
-  - `Authorization: Bearer <token>`
-- 后端每次请求解析 JWT，拿到用户 id/角色等信息用于鉴权
-- 结合 Redis 做“登录态增强”（更接近生产级）：
-  - 存 refresh token 或者 token 白名单/黑名单（用于退出登录、强制下线）
-  - 记录 token 版本号（用户改密码后让旧 token 失效）
-
-预期收益：
-- 后端更接近“无状态”（stateless），更适合水平扩展
-- 前后端完全通过 Token 交互，跨域/多端（Web/小程序/App）更方便
-- 配合 Redis 可以实现更强的安全能力（登出立即失效、风控等）
-- 为微服务架构提供基础能力
-
-## 后续可扩展方向（Spring Security + JWT + Redis）
-
-### 1）引入 Spring Security（统一认证与授权）
-
-当前实现：
-- 使用自定义拦截器判断登录态
-- 管理员权限通过代码手动校验
-- 登录态：Http Session（`USER_LOGIN_STATE` + `JSESSIONID`）
-- 管理员鉴权：自定义拦截器拦截 `/admin/**`，在拦截器里判断是否管理员
-- 授权粒度：偏“路径级别”（只要是 `/admin/**` 就需要管理员）
-
-可扩展为：
-- 使用 Spring Security 统一接管认证与授权流程
-- 自定义 `UserDetailsService`，从数据库加载用户与角色信息
-- 使用 `SecurityContext` 保存当前登录用户
-- 通过注解方式控制权限，例如：
-  - `@PreAuthorize("hasRole('ADMIN')")`
-  - `@PreAuthorize("hasAuthority('user:delete')")`
-
-预期收益：
-- 认证与授权逻辑标准化、可维护性更高
-- 更容易把“路径级权限”升级为“接口级/方法级权限”
-- 统一处理 401/403、权限不足提示更一致
-
-### 2）引入 Redis（缓存与登录态增强）
-
-当前实现：
-- 登录态基于 Http Session（内存 / 容器级别）
-- 服务重启后 Session 会丢失
-- 角色判断需要查数据库（例如 user_role + role）
-
-可扩展为：
-- 使用 Redis 做 Session 存储（Spring Session + Redis）
-- 或将用户登录信息缓存到 Redis（例如 `userId -> 用户信息`）
-- 使用 Redis 缓存：
-  - 角色 / 权限列表
-  - 热点用户信息
-  - 管理员鉴权相关的查询结果（减少频繁查库）
-
-预期收益：
-- 支持服务重启不丢登录态（取决于你选 Session 还是 Token 方案）
-- 提升性能（减少数据库压力）
-- 为后续多实例/集群部署打基础
-
-### 3）从 Cookie + Session 升级为 Token（JWT）认证
-
-当前实现：
-- 浏览器通过 Cookie 自动携带 `JSESSIONID`
-- 后端依赖 Session 识别用户身份
-
-可扩展为：
-- 登录成功后返回 JWT（Access Token），前端保存并在请求头携带：
-  - `Authorization: Bearer <token>`
-- 后端每次请求解析 JWT，拿到用户 id/角色等信息用于鉴权
-- 结合 Redis 做“登录态增强”（更接近生产级）：
-  - 存 refresh token 或者 token 白名单/黑名单（用于退出登录、强制下线）
-  - 记录 token 版本号（用户改密码后让旧 token 失效）
-
-预期收益：
-- 后端更接近“无状态”（stateless），更适合水平扩展
-- 前后端完全通过 Token 交互，跨域/多端（Web/小程序/App）更方便
-- 配合 Redis 可以实现更强的安全能力（登出立即失效、风控等）
-- 为微服务架构提供基础能力
+可扩展为：Redis 缓存用户信息/角色列表、热点数据，减少查库；或 Redis 存 token 黑名单/Refresh 白名单，增强登出与 rotation 能力。
 
